@@ -35,7 +35,12 @@ from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry impor
 	get_sre_reserved_qty_details_for_voucher,
 	has_reserved_stock,
 )
-from erpnext.stock.get_item_details import get_bin_details, get_default_bom, get_price_list_rate
+from erpnext.stock.get_item_details import (
+	ItemDetailsCtx,
+	get_bin_details,
+	get_default_bom,
+	get_price_list_rate,
+)
 from erpnext.stock.stock_balance import get_reserved_qty, update_bin_qty
 
 form_grid_templates = {"items": "templates/form_grid/item_grid.html"}
@@ -84,6 +89,7 @@ class SalesOrder(SellingController):
 		company: DF.Link
 		company_address: DF.Link | None
 		company_address_display: DF.TextEditor | None
+		company_contact_person: DF.Link | None
 		contact_display: DF.SmallText | None
 		contact_email: DF.Data | None
 		contact_mobile: DF.SmallText | None
@@ -169,7 +175,6 @@ class SalesOrder(SellingController):
 		tc_name: DF.Link | None
 		terms: DF.TextEditor | None
 		territory: DF.Link | None
-		title: DF.Data | None
 		to_date: DF.Date | None
 		total: DF.Currency
 		total_commission: DF.Currency
@@ -233,6 +238,11 @@ class SalesOrder(SellingController):
 			self.advance_payment_status = "Not Requested"
 
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
+		self.enable_auto_reserve_stock()
+
+	def enable_auto_reserve_stock(self):
+		if self.is_new() and frappe.db.get_single_value("Stock Settings", "auto_reserve_stock"):
+			self.reserve_stock = 1
 
 	def validate_po(self):
 		# validate p.o date v/s delivery date
@@ -849,8 +859,8 @@ def make_material_request(source_name, target_doc=None):
 			target.item_code, target.warehouse, source_parent.company, True
 		).get("actual_qty", 0)
 
-		args = target.as_dict().copy()
-		args.update(
+		ctx = ItemDetailsCtx(target.as_dict().copy())
+		ctx.update(
 			{
 				"company": source_parent.get("company"),
 				"price_list": frappe.db.get_single_value("Buying Settings", "buying_price_list"),
@@ -860,7 +870,7 @@ def make_material_request(source_name, target_doc=None):
 		)
 
 		target.rate = flt(
-			get_price_list_rate(args=args, item_doc=frappe.get_cached_doc("Item", target.item_code)).get(
+			get_price_list_rate(ctx, item_doc=frappe.get_cached_doc("Item", target.item_code)).get(
 				"price_list_rate"
 			)
 		)
@@ -878,7 +888,11 @@ def make_material_request(source_name, target_doc=None):
 			},
 			"Sales Order Item": {
 				"doctype": "Material Request Item",
-				"field_map": {"name": "sales_order_item", "parent": "sales_order"},
+				"field_map": {
+					"name": "sales_order_item",
+					"parent": "sales_order",
+					"delivery_date": "required_by",
+				},
 				"condition": lambda item: not frappe.db.exists(
 					"Product Bundle", {"name": item.item_code, "disabled": 0}
 				)
@@ -1247,7 +1261,10 @@ def get_events(start, end, filters=None):
 		""",
 		{"start": start, "end": end},
 		as_dict=True,
-		update={"allDay": 0},
+		update={
+			"allDay": 0,
+			"convertToUserTz": 0,
+		},
 	)
 	return data
 
@@ -1364,11 +1381,14 @@ def make_purchase_order_for_default_supplier(source_name, selected_items=None, t
 						"discount_percentage",
 						"discount_amount",
 						"pricing_rules",
+						"margin_type",
+						"margin_rate_or_amount",
 					],
 					"postprocess": update_item,
 					"condition": lambda doc: doc.ordered_qty < doc.stock_qty
 					and doc.supplier == supplier
-					and doc.item_code in items_to_map,
+					and doc.item_code in items_to_map
+					and doc.delivered_by_supplier == 1,
 				},
 			},
 			target_doc,
@@ -1417,9 +1437,17 @@ def make_purchase_order(source_name, selected_items=None, target_doc=None):
 		target.payment_schedule = []
 
 		if is_drop_ship_order(target):
-			target.customer = source.customer
-			target.customer_name = source.customer_name
-			target.shipping_address = source.shipping_address_name
+			if source.shipping_address_name:
+				target.shipping_address = source.shipping_address_name
+				target.shipping_address_display = source.shipping_address
+			else:
+				target.shipping_address = source.customer_address
+				target.shipping_address_display = source.address_display
+
+			target.customer_contact_person = source.contact_person
+			target.customer_contact_display = source.contact_display
+			target.customer_contact_mobile = source.contact_mobile
+			target.customer_contact_email = source.contact_email
 		else:
 			target.customer = target.customer_name = target.shipping_address = None
 
@@ -1504,6 +1532,7 @@ def make_purchase_order(source_name, selected_items=None, target_doc=None):
 	)
 
 	set_delivery_date(doc.items, source_name)
+	doc.set_onload("load_after_mapping", False)
 
 	return doc
 
